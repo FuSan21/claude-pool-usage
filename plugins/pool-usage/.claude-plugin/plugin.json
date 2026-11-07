@@ -1,0 +1,11 @@
+{
+  "name": "pool-usage",
+  "displayName": "Pool Usage",
+  "version": "0.1.0",
+  "description": "Shows the remaining 5-hour and weekly usage of the Claude account pool behind a sub2api gateway, checked with your own API key.",
+  "author": { "name": "FuSan21", "url": "https://github.com/FuSan21" },
+  "homepage": "https://github.com/FuSan21/claude-pool-usage",
+  "repository": "https://github.com/FuSan21/claude-pool-usage",
+  "license": "MIT",
+  "keywords": ["usage", "rate-limit", "statusline", "sub2api", "gateway"]
+}

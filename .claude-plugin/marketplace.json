@@ -1,0 +1,14 @@
+{
+  "name": "claude-pool-usage",
+  "owner": { "name": "FuSan21", "url": "https://github.com/FuSan21" },
+  "metadata": {
+    "description": "Claude Code plugins for teams sharing a sub2api account pool."
+  },
+  "plugins": [
+    {
+      "name": "pool-usage",
+      "source": "./plugins/pool-usage",
+      "description": "Remaining 5-hour and weekly usage of the shared account pool, checked with your own API key."
+    }
+  ]
+}
