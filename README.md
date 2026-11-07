@@ -33,8 +33,11 @@ Then:
 - A one-line notice appears when a session starts.
 - **`/pool-usage:statusline`** (optional) adds the line to your status bar.
   Plugins can't set the status line themselves, so this copies the script to
-  `~/.claude/pool-usage-statusline.sh` and adds a `statusLine` entry to your
-  `~/.claude/settings.json`. Run it again after plugin updates.
+  `~/.claude/pool-usage-statusline.sh` and edits `statusLine` in your
+  `~/.claude/settings.json`. If you already have a status line (claude-hud, for
+  example), it is kept: it runs first and the pool line appears under it. Run
+  the command again after plugin updates; ask it to remove the line to restore
+  your previous status line.
 
 Requires `bash` and `curl` (on Windows, the Git Bash that Claude Code uses).
 

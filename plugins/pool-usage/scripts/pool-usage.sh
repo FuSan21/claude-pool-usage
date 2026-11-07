@@ -3,6 +3,8 @@
 # sub2api gateway, using the same API key Claude Code already sends.
 #
 #   pool-usage.sh line    one line, for the status line (cached)
+#   pool-usage.sh wrap    status line that first runs the previous statusLine command
+#                         (saved in ~/.claude/pool-usage-statusline.prev), then adds our line
 #   pool-usage.sh hook    SessionStart hook output ({"systemMessage": ...})
 #   pool-usage.sh full    multi-line breakdown, for /pool-usage
 #
@@ -32,8 +34,20 @@ token="${ANTHROPIC_AUTH_TOKEN:-${ANTHROPIC_API_KEY:-}}"
 [ -n "$token" ] || token="$(settings_env ANTHROPIC_API_KEY)"
 custom="${ANTHROPIC_CUSTOM_HEADERS:-$(settings_env ANTHROPIC_CUSTOM_HEADERS)}"
 
-# Statusline gets session JSON on stdin; it isn't needed here.
-[ "$mode" = "line" ] && [ ! -t 0 ] && cat >/dev/null
+# Chain mode: hand the session JSON to the status line that was there before
+# (e.g. claude-hud), print its output, then continue as a normal line below it.
+if [ "$mode" = "wrap" ]; then
+  input=""
+  [ -t 0 ] || input="$(cat)"
+  prev_file="${CLAUDE_CONFIG_DIR:-$HOME/.claude}/pool-usage-statusline.prev"
+  if [ -s "$prev_file" ]; then
+    printf '%s' "$input" | bash -c "$(cat "$prev_file")"
+  fi
+  mode="line"
+elif [ "$mode" = "line" ] && [ ! -t 0 ]; then
+  # Statusline gets session JSON on stdin; it isn't needed here.
+  cat >/dev/null
+fi
 
 fail() {
   case "$mode" in
