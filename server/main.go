@@ -25,30 +25,18 @@ import (
 )
 
 type window struct {
-	RemainingPercent  float64    `json:"remaining_percent"`
-	RemainingAccounts float64    `json:"remaining_accounts"`
-	NextResetAt       *time.Time `json:"next_reset_at,omitempty"`
+	RemainingPercent float64    `json:"remaining_percent"`
+	NextResetAt      *time.Time `json:"next_reset_at,omitempty"`
 }
 
-type accountView struct {
-	Label        string     `json:"label"`
-	State        string     `json:"state"`
-	FiveHourUsed *float64   `json:"five_hour_used_percent,omitempty"`
-	FiveHourEnd  *time.Time `json:"five_hour_resets_at,omitempty"`
-	SevenDayUsed *float64   `json:"seven_day_used_percent,omitempty"`
-	SevenDayEnd  *time.Time `json:"seven_day_resets_at,omitempty"`
-	SampledAt    *time.Time `json:"sampled_at,omitempty"`
-}
-
+// Only pool totals are returned; individual accounts are never exposed.
 type poolResponse struct {
-	Group     string        `json:"group"`
-	Accounts  int           `json:"accounts"`
-	Unsampled int           `json:"unsampled_accounts"`
-	FiveHour  window        `json:"five_hour"`
-	SevenDay  window        `json:"seven_day"`
-	PerAcct   []accountView `json:"per_account"`
-	Text      string        `json:"text"`
-	Generated time.Time     `json:"generated_at"`
+	Group     string    `json:"group"`
+	FiveHour  window    `json:"five_hour"`
+	SevenDay  window    `json:"seven_day"`
+	Text      string    `json:"text"`
+	Generated time.Time `json:"generated_at"`
+	accounts  int
 }
 
 type cached struct {
@@ -197,6 +185,8 @@ func respond(w http.ResponseWriter, r *http.Request, resp poolResponse) {
 		writePlain(w, resp.Text)
 	case "full":
 		writePlain(w, renderFull(resp, time.Now().UTC()))
+	case "hud":
+		writeJSON(w, http.StatusOK, hudSnapshot(resp))
 	default:
 		writeJSON(w, http.StatusOK, resp)
 	}
@@ -247,8 +237,7 @@ func (s *server) build(ctx context.Context, groupID int64, groupName string) (po
 		       a.session_window_end,
 		       a.extra->>'session_window_utilization',
 		       a.extra->>'passive_usage_7d_utilization',
-		       a.extra->>'passive_usage_7d_reset',
-		       a.extra->>'passive_usage_sampled_at'
+		       a.extra->>'passive_usage_7d_reset'
 		FROM accounts a
 		JOIN account_groups ag ON ag.account_id = a.id
 		WHERE ag.group_id = $1 AND a.deleted_at IS NULL
@@ -260,7 +249,7 @@ func (s *server) build(ctx context.Context, groupID int64, groupName string) (po
 	defer rows.Close()
 
 	now := time.Now().UTC()
-	resp := poolResponse{Group: groupName, Generated: now, PerAcct: []accountView{}}
+	resp := poolResponse{Group: groupName, Generated: now}
 	var sum5, sum7 float64
 	var next5, next7 *time.Time
 	earliest := func(cur *time.Time, t *time.Time) *time.Time {
@@ -278,17 +267,17 @@ func (s *server) build(ctx context.Context, groupID int64, groupName string) (po
 		var status string
 		var schedulable bool
 		var rlReset, tempUntil, overload, sessEnd *time.Time
-		var u5s, u7s, r7s, sampledS *string
-		if err := rows.Scan(&id, &status, &schedulable, &rlReset, &tempUntil, &overload, &sessEnd, &u5s, &u7s, &r7s, &sampledS); err != nil {
+		var u5s, u7s, r7s *string
+		if err := rows.Scan(&id, &status, &schedulable, &rlReset, &tempUntil, &overload, &sessEnd, &u5s, &u7s, &r7s); err != nil {
 			return poolResponse{}, err
 		}
-		resp.Accounts++
-		v := accountView{Label: fmt.Sprintf("account %d", resp.Accounts), State: "ok", SampledAt: parseUnix(sampledS)}
+		resp.accounts++
 
 		limited := rlReset != nil && rlReset.After(now)
 		paused := (tempUntil != nil && tempUntil.After(now)) || (overload != nil && overload.After(now))
 
 		// 5-hour window: utilization only counts while the window it was measured in is still open.
+		// An account with no data yet counts as unused.
 		u5, has5 := parseFloat(u5s)
 		if has5 && sessEnd != nil && !sessEnd.After(now) {
 			u5 = 0
@@ -299,61 +288,38 @@ func (s *server) build(ctx context.Context, groupID int64, groupName string) (po
 		if has7 && r7 != nil && !r7.After(now) {
 			u7 = 0
 		}
-		if !has5 && !has7 {
-			resp.Unsampled++
-			v.State = "no data yet"
-		}
-
 		rem5, rem7 := 1-clamp01(u5), 1-clamp01(u7)
 		if limited {
 			rem5 = 0
-			v.State = "rate limited"
 			next5 = earliest(next5, rlReset)
 		} else if paused {
 			rem5 = 0
-			v.State = "cooling down"
 		}
 		sum5 += rem5
 		sum7 += rem7
 
-		if has5 {
-			p := math.Round(clamp01(u5)*1000) / 10
-			v.FiveHourUsed = &p
-			if sessEnd != nil && sessEnd.After(now) {
-				t := sessEnd.UTC()
-				v.FiveHourEnd = &t
-				if u5 > 0 {
-					next5 = earliest(next5, &t)
-				}
-			}
+		if has5 && u5 > 0 && sessEnd != nil {
+			t := sessEnd.UTC()
+			next5 = earliest(next5, &t)
 		}
-		if has7 {
-			p := math.Round(clamp01(u7)*1000) / 10
-			v.SevenDayUsed = &p
-			if r7 != nil && r7.After(now) {
-				v.SevenDayEnd = r7
-				if u7 > 0 {
-					next7 = earliest(next7, r7)
-				}
-			}
+		if has7 && u7 > 0 {
+			next7 = earliest(next7, r7)
 		}
-		resp.PerAcct = append(resp.PerAcct, v)
 	}
 	if err := rows.Err(); err != nil {
 		return poolResponse{}, err
 	}
 
-	if resp.Accounts > 0 {
-		n := float64(resp.Accounts)
-		resp.FiveHour = window{RemainingPercent: round1(sum5 / n * 100), RemainingAccounts: round2(sum5), NextResetAt: next5}
-		resp.SevenDay = window{RemainingPercent: round1(sum7 / n * 100), RemainingAccounts: round2(sum7), NextResetAt: next7}
+	if resp.accounts > 0 {
+		n := float64(resp.accounts)
+		resp.FiveHour = window{RemainingPercent: round1(sum5 / n * 100), NextResetAt: next5}
+		resp.SevenDay = window{RemainingPercent: round1(sum7 / n * 100), NextResetAt: next7}
 	}
 	resp.Text = renderText(resp, now)
 	return resp, nil
 }
 
 func round1(f float64) float64 { return math.Round(f*10) / 10 }
-func round2(f float64) float64 { return math.Round(f*100) / 100 }
 
 func humanUntil(t *time.Time, now time.Time) string {
 	if t == nil {
@@ -377,7 +343,7 @@ func humanUntil(t *time.Time, now time.Time) string {
 }
 
 func renderText(resp poolResponse, now time.Time) string {
-	if resp.Accounts == 0 {
+	if resp.accounts == 0 {
 		return "pool: no accounts available"
 	}
 	part := func(name string, w window) string {
@@ -387,48 +353,45 @@ func renderText(resp poolResponse, now time.Time) string {
 		}
 		return s
 	}
-	out := fmt.Sprintf("%s · %s · %d acct", part("5h", resp.FiveHour), part("7d", resp.SevenDay), resp.Accounts)
-	if resp.Accounts != 1 {
-		out += "s"
+	return part("5h", resp.FiveHour) + " · " + part("7d", resp.SevenDay)
+}
+
+// hudSnapshot matches claude-hud's display.externalUsagePath file format, so
+// claude-hud draws the pool as its own 5h / 7d usage bars. Pool "used" is
+// 100 minus the remaining percentage across all accounts.
+func hudSnapshot(resp poolResponse) map[string]any {
+	win := func(w window) map[string]any {
+		out := map[string]any{"used_percentage": nil, "resets_at": nil}
+		if resp.accounts > 0 {
+			out["used_percentage"] = round1(100 - w.RemainingPercent)
+		}
+		if w.NextResetAt != nil {
+			out["resets_at"] = w.NextResetAt.Format(time.RFC3339)
+		}
+		return out
 	}
-	if resp.Unsampled > 0 {
-		out += fmt.Sprintf(" (%d unsampled)", resp.Unsampled)
+	return map[string]any{
+		"updated_at": resp.Generated.Format(time.RFC3339),
+		"five_hour":  win(resp.FiveHour),
+		"seven_day":  win(resp.SevenDay),
 	}
-	return out
 }
 
 // renderFull is the multi-line view used by the /pool-usage command.
 func renderFull(resp poolResponse, now time.Time) string {
-	if resp.Accounts == 0 {
-		return fmt.Sprintf("Pool %q has no available accounts.", resp.Group)
+	if resp.accounts == 0 {
+		return fmt.Sprintf("Pool %s has no available accounts.", resp.Group)
 	}
 	var b strings.Builder
-	fmt.Fprintf(&b, "Pool %s · %d accounts\n", resp.Group, resp.Accounts)
+	fmt.Fprintf(&b, "Pool usage · %s\n", resp.Group)
 	line := func(name string, w window) {
-		fmt.Fprintf(&b, "  %s  %5.1f%% left  (%.2f of %d accounts)", name, w.RemainingPercent, w.RemainingAccounts, resp.Accounts)
+		fmt.Fprintf(&b, "  %s  %5.1f%% left", name, w.RemainingPercent)
 		if r := humanUntil(w.NextResetAt, now); r != "" {
-			fmt.Fprintf(&b, "  next reset in %s", r)
+			fmt.Fprintf(&b, "  · next reset in %s", r)
 		}
 		b.WriteString("\n")
 	}
 	line("5h", resp.FiveHour)
 	line("7d", resp.SevenDay)
-	b.WriteString("\n")
-	used := func(p *float64, t *time.Time) string {
-		if p == nil {
-			return "     -     "
-		}
-		s := fmt.Sprintf("%3.0f%% used", *p)
-		if r := humanUntil(t, now); r != "" {
-			s += " (reset " + r + ")"
-		}
-		return s
-	}
-	for _, a := range resp.PerAcct {
-		fmt.Fprintf(&b, "  %-10s  5h %-26s  7d %-26s  %s\n", a.Label, used(a.FiveHourUsed, a.FiveHourEnd), used(a.SevenDayUsed, a.SevenDayEnd), a.State)
-	}
-	if resp.Unsampled > 0 {
-		b.WriteString("\nAccounts with no data yet are counted as unused until they serve a request.\n")
-	}
 	return strings.TrimRight(b.String(), "\n")
 }
