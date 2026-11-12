@@ -101,8 +101,18 @@ if [ "$mode" = "wrap" ]; then
   if [ -s "$prev_file" ]; then
     printf '%s' "$input" | bash -c "$(cat "$prev_file")"
   fi
-  # claude-hud draws the bars from the snapshot; no separate text line needed.
-  [ -d "$hud_dir" ] && exit 0
+  # claude-hud draws the pool bars from the snapshot; add only the caller's own
+  # share of the pool (empty when the gateway doesn't support it).
+  if [ -d "$hud_dir" ]; then
+    you_file="$hud_dir/you.txt"
+    if [ ! -f "$you_file" ] || [ "$(file_age "$you_file")" -ge "$cache_ttl" ]; then
+      body="$(fetch you)" || body=""
+      case "$body" in "{"*) body="" ;; esac # older server without the "you" format
+      printf '%s' "$body" >"$you_file" 2>/dev/null
+    fi
+    [ -s "$you_file" ] && { cat "$you_file"; echo; }
+    exit 0
+  fi
   mode="line"
 elif [ "$mode" = "line" ] && [ ! -t 0 ]; then
   # Statusline gets session JSON on stdin; it isn't needed here.

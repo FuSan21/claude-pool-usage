@@ -15,6 +15,17 @@ claude-hud's own usage bars:
 Context █░░░░░░░░░ 12% │ Usage ██░░░░░░░░ 25% (resets in 2h 22m) │ ██████░░░░ 60% (resets in 15h 42m)
 ```
 
+On a gateway running the [FuSan21/sub2api](https://github.com/FuSan21/sub2api)
+fork, it also shows **your own share** of the pool (the fork's "usage share":
+how much of the accounts' limits your requests used, and your limit if the
+admin set one):
+
+```
+5h 75% left (reset 2h22m) · 7d 40% left (reset 15h42m) · you 7d 12.0%/20% · 5h 3.1%
+```
+
+With claude-hud, that `you …` part is printed on its own line under the bars.
+
 It has two parts:
 
 | Part | What it is |
@@ -69,8 +80,14 @@ every response, so an account's numbers are as fresh as its latest request.
 `GET /v1/pool-usage` authenticates with the same API key (`x-api-key` or
 `Authorization: Bearer`). Responses: JSON by default, `?format=text` for the one
 line, `?format=full` for the two-line view, `?format=hud` for a claude-hud
-`externalUsagePath` snapshot. Results are cached per group for 15s. Only pool
-totals are returned, never individual accounts.
+`externalUsagePath` snapshot, `?format=you` for just the caller's share. Pool
+results are cached per group for 15s. Only pool totals are returned, never
+individual accounts.
+
+With `SUB2API_URL` set (e.g. `http://sub2api:8080`), the server also asks the
+gateway's `GET /v1/usage-share` (FuSan21/sub2api fork) for the caller's share
+using the same key, and adds it as `you` in the JSON and to the text views. On
+upstream sub2api, or when unset, that part is simply omitted.
 
 It needs a read-only Postgres role on the sub2api database:
 
@@ -102,7 +119,8 @@ Add it to the sub2api compose and route only `/v1/pool-usage` to it:
 ```
 
 Environment: `DATABASE_URL` (required), `DATABASE_PASSWORD_FILE`,
-`LISTEN_ADDR` (default `:8090`), `CACHE_SECONDS` (default 15).
+`LISTEN_ADDR` (default `:8090`), `CACHE_SECONDS` (default 15), `SUB2API_URL`
+(optional, enables the caller's usage share).
 
 ## License
 

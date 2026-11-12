@@ -35,8 +35,23 @@ type poolResponse struct {
 	FiveHour  window    `json:"five_hour"`
 	SevenDay  window    `json:"seven_day"`
 	Text      string    `json:"text"`
+	You       *share    `json:"you,omitempty"`
 	Generated time.Time `json:"generated_at"`
 	accounts  int
+}
+
+// share is the caller's own consumption of the pool, from sub2api's
+// /v1/usage-share (FuSan21/sub2api fork). Percentages are of the whole pool.
+type share struct {
+	Enforced       bool       `json:"enforced"`
+	Used5hPct      float64    `json:"used_5h_pct"`
+	Used7dPct      float64    `json:"used_7d_pct"`
+	Limit5hPct     *float64   `json:"limit_5h_pct"`
+	Limit7dPct     *float64   `json:"limit_7d_pct"`
+	Remaining5hPct *float64   `json:"remaining_5h_pct"`
+	Remaining7dPct *float64   `json:"remaining_7d_pct"`
+	Blocked        bool       `json:"blocked"`
+	FreesAt        *time.Time `json:"frees_at,omitempty"`
 }
 
 type cached struct {
@@ -45,10 +60,12 @@ type cached struct {
 }
 
 type server struct {
-	db    *pgxpool.Pool
-	ttl   time.Duration
-	mu    sync.Mutex
-	cache map[int64]cached
+	db       *pgxpool.Pool
+	ttl      time.Duration
+	mu       sync.Mutex
+	cache    map[int64]cached
+	shareURL string // empty = disabled
+	client   *http.Client
 }
 
 func main() {
@@ -81,7 +98,11 @@ func run(db *pgxpool.Pool) {
 	if v, err := strconv.Atoi(os.Getenv("CACHE_SECONDS")); err == nil && v >= 0 {
 		ttl = time.Duration(v) * time.Second
 	}
-	s := &server{db: db, ttl: ttl, cache: map[int64]cached{}}
+	s := &server{db: db, ttl: ttl, cache: map[int64]cached{}, client: &http.Client{Timeout: 2 * time.Second}}
+	// SUB2API_URL (e.g. http://sub2api:8080) enables the caller's own usage share.
+	if base := strings.TrimRight(os.Getenv("SUB2API_URL"), "/"); base != "" {
+		s.shareURL = base + "/v1/usage-share"
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/v1/pool-usage", s.handle)
 	mux.HandleFunc("/v1/pool-usage/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -160,23 +181,55 @@ func (s *server) handle(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.mu.Lock()
-	if c, ok := s.cache[groupID]; ok && time.Since(c.at) < s.ttl {
+	c, ok := s.cache[groupID]
+	s.mu.Unlock()
+	resp := c.resp
+	if !ok || time.Since(c.at) >= s.ttl {
+		var err error
+		resp, err = s.build(ctx, groupID, groupName)
+		if err != nil {
+			log.Printf("build group %d: %v", groupID, err)
+			writeErr(w, http.StatusInternalServerError, "api_error", "usage unavailable")
+			return
+		}
+		s.mu.Lock()
+		s.cache[groupID] = cached{at: time.Now(), resp: resp}
 		s.mu.Unlock()
-		respond(w, r, c.resp)
-		return
 	}
-	s.mu.Unlock()
-
-	resp, err := s.build(ctx, groupID, groupName)
-	if err != nil {
-		log.Printf("build group %d: %v", groupID, err)
-		writeErr(w, http.StatusInternalServerError, "api_error", "usage unavailable")
-		return
+	// The pool is cached per group; the share is per key, so fetch it each time.
+	resp.You = s.fetchShare(ctx, key)
+	if resp.You != nil {
+		resp.Text = renderText(resp, time.Now().UTC())
 	}
-	s.mu.Lock()
-	s.cache[groupID] = cached{at: time.Now(), resp: resp}
-	s.mu.Unlock()
 	respond(w, r, resp)
+}
+
+// fetchShare asks sub2api for the key's usage share; nil when unavailable.
+func (s *server) fetchShare(ctx context.Context, key string) *share {
+	if s.shareURL == "" {
+		return nil
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, s.shareURL, nil)
+	if err != nil {
+		return nil
+	}
+	req.Header.Set("x-api-key", key)
+	res, err := s.client.Do(req)
+	if err != nil {
+		log.Printf("usage share: %v", err)
+		return nil
+	}
+	defer res.Body.Close()
+	if res.StatusCode != http.StatusOK {
+		return nil
+	}
+	var body struct {
+		Data *share `json:"data"`
+	}
+	if err := json.NewDecoder(res.Body).Decode(&body); err != nil {
+		return nil
+	}
+	return body.Data
 }
 
 func respond(w http.ResponseWriter, r *http.Request, resp poolResponse) {
@@ -185,6 +238,8 @@ func respond(w http.ResponseWriter, r *http.Request, resp poolResponse) {
 		writePlain(w, resp.Text)
 	case "full":
 		writePlain(w, renderFull(resp, time.Now().UTC()))
+	case "you":
+		writePlain(w, renderYou(resp.You, time.Now().UTC()))
 	case "hud":
 		writeJSON(w, http.StatusOK, hudSnapshot(resp))
 	default:
@@ -353,7 +408,33 @@ func renderText(resp poolResponse, now time.Time) string {
 		}
 		return s
 	}
-	return part("5h", resp.FiveHour) + " · " + part("7d", resp.SevenDay)
+	out := part("5h", resp.FiveHour) + " · " + part("7d", resp.SevenDay)
+	if y := renderYou(resp.You, now); y != "" {
+		out += " · " + y
+	}
+	return out
+}
+
+// renderYou is the caller's share, e.g. "you 7d 12.0%/20% · 5h 3.1%".
+func renderYou(y *share, now time.Time) string {
+	if y == nil {
+		return ""
+	}
+	part := func(name string, used float64, limit *float64) string {
+		s := fmt.Sprintf("%s %.1f%%", name, used)
+		if limit != nil {
+			s += fmt.Sprintf("/%g%%", *limit)
+		}
+		return s
+	}
+	out := "you " + part("7d", y.Used7dPct, y.Limit7dPct) + " · " + part("5h", y.Used5hPct, y.Limit5hPct)
+	if y.Blocked {
+		out += " · limit reached"
+		if r := humanUntil(y.FreesAt, now); r != "" {
+			out += ", frees in " + r
+		}
+	}
+	return out
 }
 
 // hudSnapshot matches claude-hud's display.externalUsagePath file format, so
@@ -393,5 +474,23 @@ func renderFull(resp poolResponse, now time.Time) string {
 	}
 	line("5h", resp.FiveHour)
 	line("7d", resp.SevenDay)
+	if y := resp.You; y != nil {
+		you := func(name string, used float64, limit, remaining *float64) {
+			fmt.Fprintf(&b, "  you %s  %5.1f%% of the pool used", name, used)
+			if limit != nil && remaining != nil {
+				fmt.Fprintf(&b, "  · limit %g%%, %.1f%% left", *limit, *remaining)
+			}
+			b.WriteString("\n")
+		}
+		you("7d", y.Used7dPct, y.Limit7dPct, y.Remaining7dPct)
+		you("5h", y.Used5hPct, y.Limit5hPct, y.Remaining5hPct)
+		if y.Blocked {
+			b.WriteString("  Your limit is reached")
+			if r := humanUntil(y.FreesAt, now); r != "" {
+				fmt.Fprintf(&b, "; it frees up in %s", r)
+			}
+			b.WriteString(".\n")
+		}
+	}
 	return strings.TrimRight(b.String(), "\n")
 }
